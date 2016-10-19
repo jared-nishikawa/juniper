@@ -1,0 +1,182 @@
+#!/usr/bin/python
+
+
+from twisted.internet import reactor
+from twisted.web import http
+from twisted.internet import protocol
+from twisted.internet import ssl
+from OpenSSL import crypto, SSL
+
+from certsproxy import genCert
+
+HTTPMETHODS = ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+PROTO = "HTTP/1.1\r"
+LOGGING = False
+
+class ProxyProtocol(protocol.Protocol):
+    def __parseURL(self,url):
+        tokens = url.split(':')
+        newurl = ':'.join(tokens[1:])
+        newurl = newurl.lstrip('/')
+        tokens = newurl.split(':')
+        if tokens[1:]:
+            port = tokens[1].split('/')[0]
+            tokens[1] = tokens[1].lstrip(port)
+            port = int(port)
+        else:
+            port = 80
+        newurl = ''.join(tokens)
+        cut = newurl.index('/')
+        host = newurl[:cut]
+        path = newurl[cut:]
+        return host,path,port
+    
+    def __makeHeader(self,method, path):
+        if not path:
+            path = '/'
+        header = ' '.join([method,path,PROTO])
+        return header
+    
+    def __generateRequest(self,host,path,port,method,packet):
+        header = self.__makeHeader(method, path)
+        lines = packet.split('\n')
+        lines[0] = header
+        return '\n'.join(lines)
+   
+    def __parseConnect(self,tok):
+       toks = tok.split(':')
+       return toks[0], int(toks[1])
+
+    def __parsePacket(self,data):
+        lines = data.split('\n')
+        tokens = lines[0].split()
+        method = tokens[0]
+        if method == "CONNECT":
+            host,port = self.__parseConnect(tokens[1])
+            return host,None,port,method
+        url = tokens[1]
+        host,path,port = self.__parseURL(url)
+        return host,path,port,method
+
+    class ServerTLSContext(ssl.DefaultOpenSSLContextFactory):
+        def __init__(self, *args, **kwargs):
+            kwargs['sslmethod'] = SSL.TLSv1_METHOD
+            ssl.DefaultOpenSSLContextFactory.__init__(self, *args, **kwargs)
+
+    # Browser => Proxy
+    def dataReceived(self, data):
+        print "*"*80
+        print "BEGIN PROCESSING"
+        if data == "G" or data == "P":
+            print "DAMMIT"
+            return
+        #######################
+        # HANDLING HTTPS HERE #
+        #######################
+        if self.state == "HTTPS":
+            print "OK, HTTPS..."
+            if "ET" in data:
+                data = "G" + data
+            elif "OST" in data:
+                data = "P" + data
+            if not self.forwarder:
+                factory = ForwardFactory(packet=data)
+                factory.proxy = self
+                reactor.connectSSL(self.host,self.port, factory, ssl.ClientContextFactory())
+            else:
+                print "Forwarding correctly"
+                print data
+                if "POST" in data and LOGGING:
+                    with open('juniper.log', 'a') as f:
+                        pad = '\n' + '*'*20 + '\n'
+                        f.write(pad  + data + pad)
+                self.forwarder.write(data)
+            print "END HTTPS"
+            return
+
+        host,path,port,method = self.__parsePacket(data) 
+        if method == "CONNECT":
+            self.state = "HTTPS"
+            self.host = host
+            self.port = port
+            self.transport.write("HTTP/1.0 200 Connection Established\r\n\r\n")
+            cert,key = genCert(host)
+            ctx = self.ServerTLSContext(
+                    privateKeyFileName=key,
+                    certificateFileName=cert,)
+            self.transport.startTLS(ctx, self.factory)
+            #print "Was the forwarder initialized...?"
+            #print self.forwarder
+        ########################
+        ########################
+        ########################
+
+
+
+        ######################
+        # HANDLING HTTP HERE #
+        ######################
+        elif method in HTTPMETHODS:
+            packet = self.__generateRequest(host,path,port,method,data)
+            print packet
+            if not self.forwarder:
+                factory = ForwardFactory(packet=packet)
+                factory.proxy = self
+                reactor.connectTCP(host, port, factory)
+            else:
+                print "Forwarding correctly..."
+                if "POST" in packet and LOGGING:
+                    with open('juniper.log', 'a') as f:
+                        pad = '\n' + '*'*20 + '\n'
+                        f.write(pad + data + pad)
+                self.forwarder.write(packet)
+        #####################
+        #####################
+        #####################
+
+        print "END PROCESSING... READY FOR FORWARDING"
+        print "*"*80
+        print "\n"*4
+
+    # Proxy => Browser
+    def write(self, data):
+        self.transport.write(data)
+
+    def __init__(self, factory):
+        self.factory = factory
+        self.forwarder = None
+        self.state = None
+        self.host = None
+        self.port = None
+
+class ProxyFactory(protocol.Factory):
+    def buildProtocol(self, addr):
+        return ProxyProtocol(self)
+
+    def __init__(self, LOG):
+        global LOGGING
+        LOGGING = LOG
+
+class Forward(protocol.Protocol):
+    def __init__(self, factory):
+        self.factory = factory
+        self.factory.proxy.forwarder = self
+
+    def connectionMade(self):
+        # This is the first instance of Proxy => Server
+        self.transport.write(self.factory.packet)
+
+    # Server => Proxy
+    def dataReceived(self, data):
+        self.factory.proxy.write(data)
+
+    # Proxy => Server
+    def write(self, data):
+        self.transport.write(data)
+
+class ForwardFactory(protocol.ClientFactory):
+    def __init__(self, packet=None):
+        self.packet = packet
+
+    def buildProtocol(self, addr):
+        return Forward(self)
